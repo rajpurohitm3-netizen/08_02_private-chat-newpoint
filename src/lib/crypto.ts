@@ -151,6 +151,35 @@ export async function decryptWithAES(encryptedBase64: string, ivBase64: string, 
   return new TextDecoder().decode(decrypted);
 }
 
+export async function encryptBlob(blob: Blob, key: CryptoKey) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, tagLength: 128 },
+    key,
+    arrayBuffer
+  );
+  return {
+    content: new Blob([encrypted]),
+    iv: btoa(String.fromCharCode(...new Uint8Array(iv)))
+  };
+}
+
+export async function decryptBlob(encryptedBlob: Blob, ivBase64: string, key: CryptoKey) {
+  const arrayBuffer = await encryptedBlob.arrayBuffer();
+  const ivBinary = window.atob(ivBase64);
+  const ivBytes = new Uint8Array(ivBinary.length);
+  for (let i = 0; i < ivBinary.length; i++) {
+    ivBytes[i] = ivBinary.charCodeAt(i);
+  }
+  const decrypted = await window.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: ivBytes, tagLength: 128 },
+    key,
+    arrayBuffer
+  );
+  return new Blob([decrypted]);
+}
+
 export async function encryptAESKeyForUser(aesKey: CryptoKey, userPublicKey: CryptoKey) {
   const exported = await window.crypto.subtle.exportKey("raw", aesKey);
   const encrypted = await window.crypto.subtle.encrypt(

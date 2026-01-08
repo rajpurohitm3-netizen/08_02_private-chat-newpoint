@@ -20,7 +20,7 @@ import { sendPushNotification } from "@/hooks/usePushNotifications";
 import { 
   generateAESKey, encryptWithAES, decryptWithAES, 
   encryptAESKeyForUser, decryptAESKeyWithUserPrivateKey, 
-  importPublicKey 
+  importPublicKey, encryptBlob, decryptBlob
 } from "@/lib/crypto";
 
 interface ChatProps {
@@ -46,6 +46,7 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   const [showSnapshotView, setShowSnapshotView] = useState<any>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [autoDeleteMode, setAutoDeleteMode] = useState<string>("none");
+  const [decryptedMediaUrls, setDecryptedMediaUrls] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -146,6 +147,35 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
       return "[Decryption Failed: Node re-sync required]";
     }
   };
+
+  const decryptMedia = async (msg: any) => {
+    if (!msg.media_url || !msg.encrypted_content || decryptedMediaUrls[msg.id]) return;
+    
+    try {
+      const packet = JSON.parse(msg.encrypted_content);
+      if (!packet.media_iv || !packet.keys[session.user.id]) return;
+
+      if (!privateKey) return;
+      const aesKey = await decryptAESKeyWithUserPrivateKey(packet.keys[session.user.id], privateKey);
+      
+      const response = await fetch(msg.media_url);
+      const encryptedBlob = await response.blob();
+      const decryptedBlob = await decryptBlob(encryptedBlob, packet.media_iv, aesKey);
+      
+      const objectUrl = URL.createObjectURL(decryptedBlob);
+      setDecryptedMediaUrls(prev => ({ ...prev, [msg.id]: objectUrl }));
+    } catch (e) {
+      console.error("Media decryption failed:", e);
+    }
+  };
+
+  useEffect(() => {
+    messages.forEach(msg => {
+      if ((msg.media_type === "image" || msg.media_type === "video" || msg.media_type === "snapshot") && msg.media_url) {
+        decryptMedia(msg);
+      }
+    });
+  }, [messages, privateKey]);
 
   const fetchMessages = async () => {
     setLoading(true);
@@ -277,7 +307,7 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     }, 3000);
   };
 
-  const sendMessage = async (mediaType: string = "text", mediaUrl: string | null = null) => {
+  const sendMessage = async (mediaType: string = "text", mediaUrl: string | null = null, mediaIv: string | null = null) => {
     const textToSend = newMessage.trim();
     if (!textToSend && !mediaUrl) return;
 
@@ -318,6 +348,7 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
       const packet = JSON.stringify({ 
         iv: encrypted.iv, 
         content: encrypted.content, 
+        media_iv: mediaIv,
         keys: { 
           [session.user.id]: encryptedKeyForMe, 
           [initialContact.id]: encryptedKeyForPartner 
@@ -375,13 +406,20 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     canvas.getContext('2d')?.drawImage(videoRef.current, 0, 0);
     canvas.toBlob(async (blob) => {
       if (!blob) return;
-      const fileName = `snapshot-${Date.now()}.jpg`;
-      const filePath = `chat/${session.user.id}/${fileName}`;
-      const { error } = await supabase.storage.from("chat-media").upload(filePath, blob);
-      if (!error) {
-        const { data: { publicUrl } } = supabase.storage.from("chat-media").getPublicUrl(filePath);
-        await sendMessage("snapshot", publicUrl);
-        setShowCamera(false);
+      try {
+        const aesKey = await generateAESKey();
+        const encrypted = await encryptBlob(blob, aesKey);
+        const fileName = `snapshot-${Date.now()}.enc`;
+        const filePath = `chat/${session.user.id}/${fileName}`;
+        const { error } = await supabase.storage.from("chat-media").upload(filePath, encrypted.content);
+        if (!error) {
+          const { data: { publicUrl } } = supabase.storage.from("chat-media").getPublicUrl(filePath);
+          await sendMessage("snapshot", publicUrl, encrypted.iv);
+          setShowCamera(false);
+        }
+      } catch (e) {
+        console.error("Encryption failed:", e);
+        toast.error("Signal encryption failed");
       }
     }, 'image/jpeg');
   };
@@ -389,12 +427,19 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, type: "image" | "video") => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const fileName = `${Math.random()}.${file.name.split(".").pop()}`;
-    const filePath = `chat/${session.user.id}/${fileName}`;
-    const { error } = await supabase.storage.from("chat-media").upload(filePath, file);
-    if (!error) {
-      const { data: { publicUrl } } = supabase.storage.from("chat-media").getPublicUrl(filePath);
-      await sendMessage(type, publicUrl);
+    try {
+      const aesKey = await generateAESKey();
+      const encrypted = await encryptBlob(file, aesKey);
+      const fileName = `${Math.random()}.enc`;
+      const filePath = `chat/${session.user.id}/${fileName}`;
+      const { error } = await supabase.storage.from("chat-media").upload(filePath, encrypted.content);
+      if (!error) {
+        const { data: { publicUrl } } = supabase.storage.from("chat-media").getPublicUrl(filePath);
+        await sendMessage(type, publicUrl, encrypted.iv);
+      }
+    } catch (e) {
+      console.error("Encryption failed:", e);
+      toast.error("Signal encryption failed");
     }
   };
 
@@ -464,14 +509,33 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
             return (
               <motion.div key={msg.id} initial={{ opacity: 0, x: isMe ? 20 : -20 }} animate={{ opacity: 1, x: 0 }} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
                 <div className={`max-w-[80%] flex flex-col ${isMe ? "items-end" : "items-start"} relative`}>
-                  {msg.media_type === 'snapshot' ? (
-                    <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3 hover:bg-purple-600/20 transition-all">
-                      <Camera className="w-5 h-5 text-purple-400" />
-                      <span className="text-[10px] font-black uppercase text-white">Secure Snapshot</span>
-                    </button>
-                  ) : msg.media_type === 'image' ? (
-                    <img src={msg.media_url} alt="" className="rounded-[2rem] border border-white/10 max-h-80 shadow-2xl" />
-                  ) : (
+                    {msg.media_type === 'snapshot' ? (
+                      <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3 hover:bg-purple-600/20 transition-all">
+                        <Camera className="w-5 h-5 text-purple-400" />
+                        <span className="text-[10px] font-black uppercase text-white">Secure Snapshot</span>
+                      </button>
+                    ) : msg.media_type === 'image' ? (
+                      <div className="relative group">
+                        {decryptedMediaUrls[msg.id] ? (
+                          <img src={decryptedMediaUrls[msg.id]} alt="" className="rounded-[2rem] border border-white/10 max-h-80 shadow-2xl" />
+                        ) : (
+                          <div className="w-64 h-64 bg-white/[0.03] border border-white/5 rounded-[2rem] flex items-center justify-center">
+                            <Shield className="w-8 h-8 text-white/10 animate-pulse" />
+                          </div>
+                        )}
+                      </div>
+                    ) : msg.media_type === 'video' ? (
+                      <div className="relative group">
+                        {decryptedMediaUrls[msg.id] ? (
+                          <video src={decryptedMediaUrls[msg.id]} controls className="rounded-[2rem] border border-white/10 max-h-80 shadow-2xl" />
+                        ) : (
+                          <div className="w-64 h-64 bg-white/[0.03] border border-white/5 rounded-[2rem] flex items-center justify-center">
+                            <Video className="w-8 h-8 text-white/10 animate-pulse" />
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+
                     <div className={`p-5 rounded-[2rem] text-sm font-medium leading-relaxed ${isMe ? "bg-indigo-600 text-white shadow-xl shadow-indigo-600/10" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>
                       {msg.decrypted_content || "[Encrypted Signal]"}
                     </div>
@@ -556,7 +620,13 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
       <AnimatePresence>{showSnapshotView && (
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-3xl flex items-center justify-center p-4">
           <div className="relative w-full max-w-2xl aspect-[3/4] bg-zinc-900 rounded-[2rem] overflow-hidden border border-white/10 shadow-2xl">
-            <img src={showSnapshotView.media_url} alt="" className="w-full h-full object-cover" />
+            {decryptedMediaUrls[showSnapshotView.id] ? (
+              <img src={decryptedMediaUrls[showSnapshotView.id]} alt="" className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center">
+                <Shield className="w-12 h-12 text-white/10 animate-pulse" />
+              </div>
+            )}
             <div className="absolute top-0 left-0 right-0 p-6 bg-gradient-to-b from-black/60 to-transparent flex justify-between items-center">
               <div className="flex items-center gap-3">
                 <Shield className="w-4 h-4 text-purple-400" />
